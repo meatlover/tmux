@@ -955,8 +955,10 @@ struct screen_sel;
 struct screen_titles;
 struct screen {
 	char				*title;
+	char				*icon_title;
 	char *path;
 	struct screen_titles		*titles;
+	struct screen_titles		*icon_titles;
 
 	struct grid			*grid;	  /* grid data */
 
@@ -3193,9 +3195,12 @@ void	 screen_set_default_cursor(struct screen *, struct options *);
 void	 screen_set_cursor_style(u_int, enum screen_cursor_style *, int *);
 void	 screen_set_cursor_colour(struct screen *, int);
 int	 screen_set_title(struct screen *, const char *);
+void	 screen_set_icon_title(struct screen *, const char *);
 void	 screen_set_path(struct screen *, const char *);
 void	 screen_push_title(struct screen *);
 void	 screen_pop_title(struct screen *);
+void	 screen_push_icon_title(struct screen *);
+void	 screen_pop_icon_title(struct screen *);
 void	 screen_resize(struct screen *, u_int, u_int, int);
 void	 screen_resize_cursor(struct screen *, u_int, u_int, int, int, int);
 void	 screen_set_selection(struct screen *, u_int, u_int, u_int, u_int,

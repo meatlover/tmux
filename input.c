@@ -144,6 +144,10 @@ struct input_ctx {
 	 */
 	struct evbuffer			*since_ground;
 	struct event			 ground_timer;
+
+	/* OSC 5 special colour table (bold/underline/blink/reverse/italic). */
+#define INPUT_SPECIAL_COLOURS 5
+	int				 special_colours[INPUT_SPECIAL_COLOURS];
 };
 
 /* Helper functions. */
@@ -161,7 +165,9 @@ static void	input_set_state(struct input_ctx *,
 		    const struct input_transition *);
 static void	input_reset_cell(struct input_ctx *);
 static void	input_report_current_theme(struct input_ctx *);
+static void	input_osc_1(struct input_ctx *, const char *);
 static void	input_osc_4(struct input_ctx *, const char *);
+static void	input_osc_5(struct input_ctx *, const char *);
 static void	input_osc_8(struct input_ctx *, const char *);
 static void	input_osc_10(struct input_ctx *, const char *);
 static void	input_osc_11(struct input_ctx *, const char *);
@@ -198,6 +204,8 @@ static void	input_csi_dispatch_sm(struct input_ctx *);
 static void	input_csi_dispatch_sm_private(struct input_ctx *);
 static void	input_csi_dispatch_sm_graphics(struct input_ctx *);
 static void	input_csi_dispatch_winops(struct input_ctx *);
+static void	input_csi_dispatch_decrqcra(struct input_ctx *);
+static void	input_csi_dispatch_decrqm_ansi(struct input_ctx *);
 static void	input_csi_dispatch_sgr_256(struct input_ctx *, int, u_int *);
 static void	input_csi_dispatch_sgr_rgb(struct input_ctx *, int, u_int *);
 static void	input_csi_dispatch_sgr(struct input_ctx *);
@@ -218,6 +226,7 @@ struct input_table_entry {
 /* Escape commands. */
 enum input_esc_type {
 	INPUT_ESC_DECALN,
+	INPUT_ESC_DECID,
 	INPUT_ESC_DECKPAM,
 	INPUT_ESC_DECKPNM,
 	INPUT_ESC_DECRC,
@@ -249,6 +258,7 @@ static const struct input_table_entry input_esc_table[] = {
 	{ 'E', "",  INPUT_ESC_NEL },
 	{ 'H', "",  INPUT_ESC_HTS },
 	{ 'M', "",  INPUT_ESC_RI },
+	{ 'Z', "",  INPUT_ESC_DECID },
 	{ '\\', "", INPUT_ESC_ST },
 	{ 'c', "",  INPUT_ESC_RIS },
 };
@@ -294,7 +304,9 @@ enum input_csi_type {
 	INPUT_CSI_TBC,
 	INPUT_CSI_VPA,
 	INPUT_CSI_WINOPS,
-	INPUT_CSI_XDA
+	INPUT_CSI_XDA,
+	INPUT_CSI_DECRQCRA,
+	INPUT_CSI_DECRQM_ANSI
 };
 
 /* Control (CSI) command table. */
@@ -334,13 +346,15 @@ static const struct input_table_entry input_csi_table[] = {
 	{ 'n', "",  INPUT_CSI_DSR },
 	{ 'n', ">", INPUT_CSI_MODOFF },
 	{ 'n', "?", INPUT_CSI_DSR_PRIVATE },
+	{ 'p', "$",  INPUT_CSI_DECRQM_ANSI },
 	{ 'p', "?$", INPUT_CSI_QUERY_PRIVATE },
 	{ 'q', " ", INPUT_CSI_DECSCUSR },
 	{ 'q', ">", INPUT_CSI_XDA },
 	{ 'r', "",  INPUT_CSI_DECSTBM },
 	{ 's', "",  INPUT_CSI_SCP },
 	{ 't', "",  INPUT_CSI_WINOPS },
-	{ 'u', "",  INPUT_CSI_RCP }
+	{ 'u', "",  INPUT_CSI_RCP },
+	{ 'y', "*", INPUT_CSI_DECRQCRA }
 };
 
 /* Input transition. */
@@ -873,6 +887,9 @@ input_init(struct window_pane *wp, struct bufferevent *bev,
 
 	TAILQ_INIT(&ictx->requests);
 	evtimer_set(&ictx->request_timer, input_request_timer_callback, ictx);
+
+	for (u_int i = 0; i < INPUT_SPECIAL_COLOURS; i++)
+		ictx->special_colours[i] = -1;
 
 	input_reset(ictx, 0);
 	return (ictx);
@@ -1421,6 +1438,9 @@ input_esc_dispatch(struct input_ctx *ictx)
 	case INPUT_ESC_SCSG1_OFF:
 		ictx->cell.g1set = 0;
 		break;
+	case INPUT_ESC_DECID:
+		input_reply(ictx, 1, "\033[?1;0c");
+		break;
 	case INPUT_ESC_ST:
 		/* ST terminates OSC but the state transition already did it. */
 		break;
@@ -1600,43 +1620,126 @@ input_csi_dispatch(struct input_ctx *ictx)
 		break;
 	case INPUT_CSI_DSR_PRIVATE:
 		switch (input_get(ictx, 0, 0, 0)) {
+		case 6: /* DECXCPR — extended cursor position report: CSI ? row ; col ; page R */
+			input_reply(ictx, 1, "\033[?%u;%u;1R", s->cy + 1, s->cx + 1);
+			break;
+		case 15: /* printer status: no printer */
+			input_reply(ictx, 1, "\033[?13n");
+			break;
+		case 25: /* UDK status: unlocked */
+			input_reply(ictx, 1, "\033[?20n");
+			break;
+		case 26: /* keyboard status */
+			input_reply(ictx, 1, "\033[?27;1;0;1n");
+			break;
+		case 53: /* DEC locator status: no locator */
+		case 55: /* xterm locator status: no locator */
+			input_reply(ictx, 1, "\033[?50n");
+			break;
+		case 56: /* locator type: mouse = 1 */
+			input_reply(ictx, 1, "\033[?57;1n");
+			break;
+		case 62: /* DECMSR — macro space: 0 bytes */
+			input_reply(ictx, 1, "\033[0*{");
+			break;
+		case 63: /* DECCKSR — macro checksum: DCS Pid ! ~ 0000 ST */
+			n = input_get(ictx, 1, 0, 0);
+			input_reply(ictx, 1, "\033P%d!~0000\033\\", n);
+			break;
+		case 75: /* data integrity: no errors */
+			input_reply(ictx, 1, "\033[?70n");
+			break;
+		case 85: /* multiple session status: not configured */
+			input_reply(ictx, 1, "\033[?83n");
+			break;
 		case 996:
 			input_report_current_theme(ictx);
 			break;
 		}
 		break;
 	case INPUT_CSI_QUERY_PRIVATE:
-		switch (input_get(ictx, 0, 0, 0)) {
+		n = input_get(ictx, 0, 0, 0);
+		switch (n) {
+		case 1: /* DECCKM cursor keys */
+			p = (s->mode & MODE_KCURSOR) ? 1 : 2;
+			input_reply(ictx, 1, "\033[?1;%d$y", p);
+			break;
+		case 4: /* DECSCLM smooth scroll (not tracked, permanently reset) */
+			input_reply(ictx, 1, "\033[?4;4$y");
+			break;
+		case 5: /* DECSCNM screen mode (not tracked, permanently reset) */
+			input_reply(ictx, 1, "\033[?5;4$y");
+			break;
+		case 6: /* DECOM origin mode */
+			p = (s->mode & MODE_ORIGIN) ? 1 : 2;
+			input_reply(ictx, 1, "\033[?6;%d$y", p);
+			break;
+		case 7: /* DECAWM auto-wrap */
+			p = (s->mode & MODE_WRAP) ? 1 : 2;
+			input_reply(ictx, 1, "\033[?7;%d$y", p);
+			break;
 		case 12: /* cursor blink: 1 = blink, 2 = steady */
 			if (s->cstyle != SCREEN_CURSOR_DEFAULT ||
 			    s->mode & MODE_CURSOR_BLINKING_SET)
-				n = (s->mode & MODE_CURSOR_BLINKING) ? 1 : 2;
+				p = (s->mode & MODE_CURSOR_BLINKING) ? 1 : 2;
 			else {
 				if (ictx->wp != NULL)
 					oo = ictx->wp->options;
 				else
 					oo = global_options;
-				p = options_get_number(oo, "cursor-style");
-
+				n = options_get_number(oo, "cursor-style");
 				/* blink for 1,3,5; steady for 0,2,4,6 */
- 				n = (p == 1 || p == 3 || p == 5) ? 1 : 2;
+ 				p = (n == 1 || n == 3 || n == 5) ? 1 : 2;
 			}
-			input_reply(ictx, 1, "\033[?12;%d$y", n);
+			input_reply(ictx, 1, "\033[?12;%d$y", p);
 			break;
-		case 2004: /* bracketed paste */
-			n = (s->mode & MODE_BRACKETPASTE) ? 1 : 2;
-			input_reply(ictx, 1, "\033[?2004;%d$y", n);
+		case 25: /* DECTCEM cursor visible */
+			p = (s->mode & MODE_CURSOR) ? 1 : 2;
+			input_reply(ictx, 1, "\033[?25;%d$y", p);
+			break;
+		case 40: /* Allow 80/132 column switching (permanently reset) */
+			input_reply(ictx, 1, "\033[?40;4$y");
+			break;
+		case 45: /* Reverse-wraparound (not tracked, permanently reset) */
+			input_reply(ictx, 1, "\033[?45;4$y");
+			break;
+		case 67: /* DECBKM backarrow key (permanently reset) */
+			input_reply(ictx, 1, "\033[?67;4$y");
+			break;
+		case 69: /* DECLRMM left-right margin mode (permanently reset) */
+			input_reply(ictx, 1, "\033[?69;4$y");
+			break;
+		case 1000: /* mouse standard tracking */
+			p = (s->mode & MODE_MOUSE_STANDARD) ? 1 : 2;
+			input_reply(ictx, 1, "\033[?1000;%d$y", p);
+			break;
+		case 1002: /* mouse button tracking */
+			p = (s->mode & MODE_MOUSE_BUTTON) ? 1 : 2;
+			input_reply(ictx, 1, "\033[?1002;%d$y", p);
+			break;
+		case 1003: /* mouse all-motion tracking */
+			p = (s->mode & MODE_MOUSE_ALL) ? 1 : 2;
+			input_reply(ictx, 1, "\033[?1003;%d$y", p);
 			break;
 		case 1004: /* focus reporting */
-			n = (s->mode & MODE_FOCUSON) ? 1 : 2;
-			input_reply(ictx, 1, "\033[?1004;%d$y", n);
+			p = (s->mode & MODE_FOCUSON) ? 1 : 2;
+			input_reply(ictx, 1, "\033[?1004;%d$y", p);
 			break;
 		case 1006: /* SGR mouse */
-			n = (s->mode & MODE_MOUSE_SGR) ? 1 : 2;
-			input_reply(ictx, 1, "\033[?1006;%d$y", n);
+			p = (s->mode & MODE_MOUSE_SGR) ? 1 : 2;
+			input_reply(ictx, 1, "\033[?1006;%d$y", p);
+			break;
+		case 2004: /* bracketed paste */
+			p = (s->mode & MODE_BRACKETPASTE) ? 1 : 2;
+			input_reply(ictx, 1, "\033[?2004;%d$y", p);
 			break;
 		case 2031:
 			input_reply(ictx, 1, "\033[?2031;2$y");
+			break;
+		default:
+			/* Unknown DEC private mode: not recognized (0). */
+			if (n > 0)
+				input_reply(ictx, 1, "\033[?%d;0$y", n);
 			break;
 		}
 		break;
@@ -1808,6 +1911,14 @@ input_csi_dispatch(struct input_ctx *ictx)
 			input_reply(ictx, 1, "\033P>|tmux %s\033\\",
 			    getversion());
 		}
+		break;
+
+	case INPUT_CSI_DECRQCRA:
+		input_csi_dispatch_decrqcra(ictx);
+		break;
+
+	case INPUT_CSI_DECRQM_ANSI:
+		input_csi_dispatch_decrqm_ansi(ictx);
 		break;
 
 	}
@@ -2049,11 +2160,19 @@ input_csi_dispatch_winops(struct input_ctx *ictx)
 		case 5:
 		case 6:
 		case 7:
-		case 11:
-		case 13:
-		case 20:
-		case 21:
 		case 24:
+			break;
+		case 11:
+			input_reply(ictx, 1, "\033[1t");
+			break;
+		case 13:
+			input_reply(ictx, 1, "\033[3;0;0t");
+			break;
+		case 20:
+			input_reply(ictx, 1, "\033]L%s\033\\", s->icon_title);
+			break;
+		case 21:
+			input_reply(ictx, 1, "\033]l%s\033\\", s->title);
 			break;
 		case 3:
 		case 4:
@@ -2097,6 +2216,9 @@ input_csi_dispatch_winops(struct input_ctx *ictx)
 			switch (input_get(ictx, m, 0, -1)) {
 			case -1:
 				return;
+			case 1:
+				screen_push_icon_title(sctx->s);
+				break;
 			case 0:
 			case 2:
 				screen_push_title(sctx->s);
@@ -2108,6 +2230,9 @@ input_csi_dispatch_winops(struct input_ctx *ictx)
 			switch (input_get(ictx, m, 0, -1)) {
 			case -1:
 				return;
+			case 1:
+				screen_pop_icon_title(sctx->s);
+				break;
 			case 0:
 			case 2:
 				screen_pop_title(sctx->s);
@@ -2457,6 +2582,90 @@ input_enter_dcs(struct input_ctx *ictx)
 	ictx->flags &= ~INPUT_LAST;
 }
 
+/* Handle DECRQCRA (CSI Pid ; Pcid ; Pt ; Pl ; Pb ; Pr * y).
+ * Computes a 16-bit checksum of character ordinals in the rectangle and
+ * replies with: DCS Pid ! ~ HHHH ST */
+static void
+input_csi_dispatch_decrqcra(struct input_ctx *ictx)
+{
+	struct screen_write_ctx	*sctx = &ictx->ctx;
+	struct screen		*s = sctx->s;
+	int			 pid, top, left, bottom, right;
+	u_int			 sx, sy, row, col, checksum;
+	struct grid_cell	 gc;
+	wchar_t			 wc;
+
+	pid    = input_get(ictx, 0, 0, 0);
+	/* param[1] is Pcid (page number), ignored */
+	top    = input_get(ictx, 2, 1, 1);
+	left   = input_get(ictx, 3, 1, 1);
+	bottom = input_get(ictx, 4, 1, (int)screen_size_y(s));
+	right  = input_get(ictx, 5, 1, (int)screen_size_x(s));
+
+	sx = screen_size_x(s);
+	sy = screen_size_y(s);
+
+	if (top < 1)    top    = 1;
+	if (left < 1)   left   = 1;
+	if (bottom < 1) bottom = 1;
+	if (right < 1)  right  = 1;
+	if ((u_int)top    > sy) top    = (int)sy;
+	if ((u_int)left   > sx) left   = (int)sx;
+	if ((u_int)bottom > sy) bottom = (int)sy;
+	if ((u_int)right  > sx) right  = (int)sx;
+	if (top > bottom || left > right) {
+		input_reply(ictx, 1, "\033P%d!~0000\033\\", pid);
+		return;
+	}
+
+	checksum = 0;
+	for (row = (u_int)(top - 1); row < (u_int)bottom; row++) {
+		for (col = (u_int)(left - 1); col < (u_int)right; col++) {
+			grid_view_get_cell(s->grid, col, row, &gc);
+			if (gc.flags & GRID_FLAG_PADDING)
+				continue;
+			if (utf8_towc(&gc.data, &wc) == UTF8_DONE)
+				checksum += (u_int)wc;
+			else
+				checksum += 0x20; /* treat unknown as space */
+		}
+	}
+	checksum &= 0xffff;
+	input_reply(ictx, 1, "\033P%d!~%04X\033\\", pid, checksum);
+}
+
+/* Handle ANSI DECRQM (CSI Ps $ p) — report ANSI mode state.
+ * Reply: CSI Ps ; Pm $ y  where Pm: 0=not recognized, 1=set, 2=reset,
+ * 3=permanently set, 4=permanently reset */
+static void
+input_csi_dispatch_decrqm_ansi(struct input_ctx *ictx)
+{
+	struct screen_write_ctx	*sctx = &ictx->ctx;
+	struct screen		*s = sctx->s;
+	int			 mode, pm;
+
+	mode = input_get(ictx, 0, 0, 0);
+	switch (mode) {
+	case 2:  /* KAM — keyboard action (permanently reset in tmux) */
+		pm = 4;
+		break;
+	case 4:  /* IRM — insert/replace */
+		pm = (s->mode & MODE_INSERT) ? 1 : 2;
+		break;
+	case 12: /* SRM — local echo (permanently reset) */
+		pm = 4;
+		break;
+	case 20: /* LNM — line feed/new line */
+		pm = (s->mode & MODE_CRLF) ? 1 : 2;
+		break;
+	default:
+		pm = 0; /* not recognized */
+		break;
+	}
+	if (mode > 0)
+		input_reply(ictx, 1, "\033[%d;%d$y", mode, pm);
+}
+
 /* Handle DECRQSS query. */
 static int
 input_handle_decrqss(struct input_ctx *ictx)
@@ -2637,8 +2846,14 @@ input_exit_osc(struct input_ctx *ictx)
 			server_status_window(wp->window);
 		}
 		break;
+	case 1:
+		input_osc_1(ictx, p);
+		break;
 	case 4:
 		input_osc_4(ictx, p);
+		break;
+	case 5:
+		input_osc_5(ictx, p);
 		break;
 	case 7:
 		if (utf8_isvalid(p)) {
@@ -2830,6 +3045,54 @@ input_osc_colour_reply(struct input_ctx *ictx, int add, u_int n, int idx, int c,
 	}
 }
 
+/* Handle the OSC 1 sequence for setting icon title. */
+static void
+input_osc_1(struct input_ctx *ictx, const char *p)
+{
+	struct screen_write_ctx	*sctx = &ictx->ctx;
+
+	screen_set_icon_title(sctx->s, p);
+}
+
+/* Handle the OSC 5 sequence for setting/querying special colours. */
+static void
+input_osc_5(struct input_ctx *ictx, const char *p)
+{
+	char	*copy, *s, *next = NULL;
+	long	 idx;
+	int	 c;
+
+	copy = s = xstrdup(p);
+	while (s != NULL && *s != '\0') {
+		idx = strtol(s, &next, 10);
+		if (*next++ != ';')
+			break;
+		if (idx < 0 || idx >= INPUT_SPECIAL_COLOURS) {
+			s = strsep(&next, ";");
+			s = next;
+			continue;
+		}
+
+		s = strsep(&next, ";");
+		if (strcmp(s, "?") == 0) {
+			c = ictx->special_colours[idx];
+			if (c == -1)
+				c = colour_force_rgb(8); /* default: white */
+			input_osc_colour_reply(ictx, 1, 5, idx, c,
+			    ictx->input_end);
+			s = next;
+			continue;
+		}
+		if ((c = colour_parseX11(s)) == -1) {
+			s = next;
+			continue;
+		}
+		ictx->special_colours[idx] = c;
+		s = next;
+	}
+	free(copy);
+}
+
 /* Handle the OSC 4 sequence for setting (multiple) palette entries. */
 static void
 input_osc_4(struct input_ctx *ictx, const char *p)
@@ -2927,20 +3190,38 @@ input_osc_10(struct input_ctx *ictx, const char *p)
 {
 	struct window_pane	*wp = ictx->wp;
 	struct grid_cell	 defaults;
-	int			 c;
+	const char		*next;
+	int			 c, osc;
 
-	if (strcmp(p, "?") == 0) {
+	/*
+	 * xterm multi-colour query: OSC 10;?;?;? reports fg(10), bg(11),
+	 * cursor(12) for each consecutive '?' separated by ';'.
+	 */
+	if (*p == '?') {
 		if (wp == NULL)
 			return;
-		c = window_pane_get_fg_control_client(wp);
-		if (c == -1) {
-			tty_default_colours(&defaults, wp);
-			if (COLOUR_DEFAULT(defaults.fg))
-				c = window_pane_get_fg(wp);
-			else
-				c = defaults.fg;
+		for (osc = 10, next = p; *next == '?' || *next == ';'; ) {
+			if (*next == ';') {
+				next++;
+				osc++;
+				continue;
+			}
+			/* Handle this OSC slot. */
+			c = -1;
+			if (osc == 10) {
+				c = window_pane_get_fg_control_client(wp);
+				if (c == -1) {
+					tty_default_colours(&defaults, wp);
+					c = COLOUR_DEFAULT(defaults.fg)
+					    ? window_pane_get_fg(wp) : defaults.fg;
+				}
+			} else if (osc == 11) {
+				c = window_pane_get_bg(wp);
+			}
+			if (c != -1)
+				input_osc_colour_reply(ictx, 1, osc, 0, c, ictx->input_end);
+			next++;
 		}
-		input_osc_colour_reply(ictx, 1, 10, 0, c, ictx->input_end);
 		return;
 	}
 

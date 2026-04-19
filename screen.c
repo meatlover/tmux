@@ -50,6 +50,25 @@ TAILQ_HEAD(screen_titles, screen_title_entry);
 static void	screen_resize_y(struct screen *, u_int, int, u_int *);
 static void	screen_reflow(struct screen *, u_int, u_int *, u_int *, int);
 
+/* Free icon titles stack. */
+static void
+screen_free_icon_titles(struct screen *s)
+{
+	struct screen_title_entry	*title_entry;
+
+	if (s->icon_titles == NULL)
+		return;
+
+	while ((title_entry = TAILQ_FIRST(s->icon_titles)) != NULL) {
+		TAILQ_REMOVE(s->icon_titles, title_entry, entry);
+		free(title_entry->text);
+		free(title_entry);
+	}
+
+	free(s->icon_titles);
+	s->icon_titles = NULL;
+}
+
 /* Free titles stack. */
 static void
 screen_free_titles(struct screen *s)
@@ -77,7 +96,9 @@ screen_init(struct screen *s, u_int sx, u_int sy, u_int hlimit)
 	s->saved_grid = NULL;
 
 	s->title = xstrdup("");
+	s->icon_title = xstrdup("");
 	s->titles = NULL;
+	s->icon_titles = NULL;
 	s->path = NULL;
 
 	s->cstyle = SCREEN_CURSOR_DEFAULT;
@@ -152,6 +173,7 @@ screen_free(struct screen *s)
 	free(s->tabs);
 	free(s->path);
 	free(s->title);
+	free(s->icon_title);
 
 	if (s->write_list != NULL)
 		screen_write_free_list(s);
@@ -163,6 +185,7 @@ screen_free(struct screen *s)
 	if (s->hyperlinks != NULL)
 		hyperlinks_free(s->hyperlinks);
 	screen_free_titles(s);
+	screen_free_icon_titles(s);
 
 #ifdef ENABLE_SIXEL
 	image_free_all(s);
@@ -291,6 +314,50 @@ screen_pop_title(struct screen *s)
 		screen_set_title(s, title_entry->text);
 
 		TAILQ_REMOVE(s->titles, title_entry, entry);
+		free(title_entry->text);
+		free(title_entry);
+	}
+}
+
+/* Set screen icon title. */
+void
+screen_set_icon_title(struct screen *s, const char *icon_title)
+{
+	if (!utf8_isvalid(icon_title))
+		return;
+	free(s->icon_title);
+	s->icon_title = xstrdup(icon_title);
+}
+
+/* Push the current icon title onto the icon stack. */
+void
+screen_push_icon_title(struct screen *s)
+{
+	struct screen_title_entry *title_entry;
+
+	if (s->icon_titles == NULL) {
+		s->icon_titles = xmalloc(sizeof *s->icon_titles);
+		TAILQ_INIT(s->icon_titles);
+	}
+	title_entry = xmalloc(sizeof *title_entry);
+	title_entry->text = xstrdup(s->icon_title);
+	TAILQ_INSERT_HEAD(s->icon_titles, title_entry, entry);
+}
+
+/* Pop an icon title from the icon stack and set it as the screen icon title. */
+void
+screen_pop_icon_title(struct screen *s)
+{
+	struct screen_title_entry *title_entry;
+
+	if (s->icon_titles == NULL)
+		return;
+
+	title_entry = TAILQ_FIRST(s->icon_titles);
+	if (title_entry != NULL) {
+		screen_set_icon_title(s, title_entry->text);
+
+		TAILQ_REMOVE(s->icon_titles, title_entry, entry);
 		free(title_entry->text);
 		free(title_entry);
 	}
