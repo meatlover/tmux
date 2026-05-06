@@ -1140,10 +1140,52 @@ input_get(struct input_ctx *ictx, u_int validx, int minval, int defval)
 static void
 input_send_reply(struct input_ctx *ictx, const char *reply)
 {
-	if (ictx->event != NULL) {
-		log_debug("%s: %s", __func__, reply);
-		bufferevent_write(ictx->event, reply, strlen(reply));
+	struct options_entry	*o;
+	char			*v;
+
+	if (ictx->event == NULL)
+		return;
+
+	/*
+	 * Meatmux extension: when the pane (or its containing window) sets
+	 * user option `@meatmux_drop_replies` to a non-empty truthy value,
+	 * the emulator does NOT write terminal-protocol replies back into
+	 * the pane PTY. SessionKit sets this on every SSH-bound pane so
+	 * that DA1 / DA2 / XTVERSION / OSC 10/11 replies tmux generates on
+	 * behalf of the "outer terminal" do not flow into the ssh tunnel
+	 * and surface as gibberish at the remote shell prompt. See
+	 * Meatmux's docs/bugs.md (BF-090) for the full incident.
+	 *
+	 * options_get_only is used (not options_get) so the value MUST be
+	 * set on the pane or the window directly — we deliberately do not
+	 * inherit from session/server, because flipping it globally would
+	 * break local panes whose programs (vim, htop, less) rely on the
+	 * replies for terminal-feature detection.
+	 */
+	if (ictx->wp != NULL) {
+		o = options_get_only(ictx->wp->options,
+		    "@meatmux_drop_replies");
+		if (o == NULL && ictx->wp->window != NULL) {
+			o = options_get_only(ictx->wp->window->options,
+			    "@meatmux_drop_replies");
+		}
+		if (o != NULL && options_is_string(o)) {
+			v = options_to_string(o, -1, 0);
+			if (v != NULL && *v != '\0' &&
+			    strcmp(v, "0") != 0 &&
+			    strcmp(v, "off") != 0 &&
+			    strcmp(v, "no") != 0) {
+				log_debug("%s: dropped (meatmux): %s",
+				    __func__, reply);
+				free(v);
+				return;
+			}
+			free(v);
+		}
 	}
+
+	log_debug("%s: %s", __func__, reply);
+	bufferevent_write(ictx->event, reply, strlen(reply));
 }
 
 /* Reply to terminal query. */
